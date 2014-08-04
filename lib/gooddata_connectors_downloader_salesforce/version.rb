@@ -1,3 +1,3 @@
-module GooddataConnectorsDownloaderSalesforce
+module GoodDataConnectorsDownloaderSalesforce
   VERSION = "0.0.1"
 end

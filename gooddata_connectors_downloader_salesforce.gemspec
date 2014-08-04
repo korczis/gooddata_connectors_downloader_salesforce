@@ -5,11 +5,11 @@ require 'gooddata_connectors_downloader_salesforce/version'
 
 Gem::Specification.new do |spec|
   spec.name          = "gooddata_connectors_downloader_salesforce"
-  spec.version       = GooddataConnectorsDownloaderSalesforce::VERSION
+  spec.version       = GoodDataConnectorsDownloaderSalesforce::VERSION
   spec.authors       = ["Adrian Toman"]
   spec.email         = ["adrian.toman@gooddata.com"]
-  spec.description   = %q{TODO: Write a gem description}
-  spec.summary       = %q{TODO: Write a gem summary}
+  spec.description   = %q{The gem wraping the salesfroce connector implementation for Gooddata Connectors infrastructure}
+  spec.summary       = %q{}
   spec.homepage      = ""
   spec.license       = "MIT"
 
@@ -20,4 +20,7 @@ Gem::Specification.new do |spec|
 
   spec.add_development_dependency "bundler", "~> 1.3"
   spec.add_development_dependency "rake"
+  spec.add_dependency "gooddata"
+  spec.add_dependency "restforce"
+  spec.add_dependency "salesforce_bulk_query"
 end
