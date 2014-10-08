@@ -4,11 +4,15 @@ module GoodData
 
       class SalesForceDownloader < Base::BaseDownloader
         DEFAULT_VERSION = '29.0'
+        DEFAULT_MIN_DATE = DateTime.parse("1999-01-01T00:00:00.000Z")
+        DEFAULT_VALIDATION_DIRECTORY = File.join(File.dirname(__FILE__),"../validations")
+
 
         attr_accessor :client,:bulk_client
 
         def initialize(metadata,options = {})
           @type = "salesforce_downloader"
+          $now = GoodData::Connectors::Metadata::Runtime.now
           super(metadata,options)
         end
 
@@ -102,13 +106,15 @@ module GoodData
             @client = Restforce.new(credentials)
             @client.authenticate!
 
-            @bulk_client = SalesforceBulkQuery::Api.new(client, :logger => $log)
+            @bulk_client = SalesforceBulkQuery::Api.new(@client, :logger => $log)
 
           end
         end
 
         def load_entities_metadata
+          validation = @metadata.get_configuration_by_type_and_key(@type,"validation")
           @metadata.list_entities.each do |entity|
+            pp entity.id
             description = @client.describe(entity.id)
             metadata_entity = entity
             temporary_entity = Metadata::Entity.new({"id" => metadata_entity.id, "name" => metadata_entity.name})
@@ -116,6 +122,7 @@ module GoodData
               #metadata_entity["fields"] = []
               fields_in_source_system = []
               description.fields.each do |field|
+                pp field["name"]
                 type = nil
                 case field["type"]
                   when "id"
@@ -144,66 +151,155 @@ module GoodData
                 field = Metadata::Field.new({
                     "id" => field["name"],
                     "name" => field["label"],
-                    "type" => type
+                    "type" => type,
+                    "custom" => {}
                 })
                 temporary_entity.add_field(field)
               end
               # Merging entity and disabling add of new fields
               metadata_entity.merge!(temporary_entity,metadata_entity.custom["load_fields_from_source_system"])
+              # if (!metadata_entity.custom.include?("validate") or metadata_entity.custom["validate"])
+              #   folders = []
+              #   folders << File.absolute_path(DEFAULT_VALIDATION_DIRECTORY)
+              #   metadata_entity.generate_validations(folders,@type)
+              # end
+            end
+          end
+        end
+
+
+        def download_entity_data(metadata_entity)
+          single_batch = @metadata.get_configuration_by_type_and_key(@type,"single_batch")
+          begin
+            result = @bulk_client.query_fields(metadata_entity.id, {
+                                        :directory_path => @data_directory,
+                                        :created_from => Metadata::Runtime.get_entity_last_load(metadata_entity.id) || DEFAULT_MIN_DATE,
+                                        :created_to => $now,
+                                        :single_batch => single_batch,
+                                        :fields => metadata_entity.get_enabled_fields,
+                                        :timestamp => metadata_entity.custom["timestamp"]
+            })
+
+            metadata_entity.runtime["source_filename"] = merge_files(metadata_entity.id,result[:filenames])
+            backup_to_bds(metadata_entity.runtime["source_filename"])
+          rescue => e
+            $log.warn "The download with Bulk API has failed, trying to download with normal API"
+            query = construct_query(metadata_entity,metadata_entity.get_enabled_fields,Metadata::Runtime.get_entity_last_load(metadata_entity.id) || DEFAULT_MIN_DATE,$now,false,single_batch)
+            $log.info "Executing query #{query}"
+            data = @client.query(query)
+            metadata_entity.runtime["source_filename"] = create_file(data,metadata_entity)
+            backup_to_bds(metadata_entity.runtime["source_filename"])
+          end
+        end
+
+        def download_entity_deleted_records(metadata_entity)
+          fields = [metadata_entity.custom["id"],metadata_entity.custom["timestamp"],"IsDeleted"]
+          soql = construct_query(metadata_entity,fields,Metadata::Runtime.get_entity_last_load(metadata_entity.id) || DEFAULT_MIN_DATE,$now,true)
+          metadata_entity.runtime["source_deleted_filename"] = create_deleted_file(query_all(@client,soql),metadata_entity)
+          backup_to_bds(metadata_entity.runtime["source_deleted_filename"])
+        end
+
+        def execute_validations(metadata_entity)
+          metadata_entity.validations.each_pair do |key,types|
+            types.each_pair do |type,validation|
+              if (type == @type)
+                values = {
+                    "id" => metadata_entity.custom["id"],
+                    "timestamap" => metadata_entity.custom["timestamp"],
+                    "to" => $now,
+                    "from" => Metadata::Runtime.get_entity_last_load(metadata_entity.id),
+                    "entity_id" => metadata_entity.id
+                }
+                soql = Base::Templates.make_validation_template(validation,values)
+                data = @client.query(soql)
+                data.map do |row_hash|
+                  validation.value = row_hash["expr0"]
+                end
+              end
+            end
+          end
+        end
+
+
+        def download_fields_for_additional_synchronization(metadata_entity)
+          # In case that field is added to entity after the entity was already created, we need to resynchronize the last values
+          single_batch = @metadata.get_configuration_by_type_and_key(@type,"single_batch")
+          new_fields = metadata_entity.fields.values.find_all{|f| !f.disabled? and f.custom["synchronized"] == false }
+          if (!Metadata::Runtime.get_entity_last_load(metadata_entity.id).nil? and !new_fields.empty? )
+            begin
+              result = @bulk_client.query_fields(metadata_entity.id, {
+                  :directory_path => @data_directory,
+                  :created_from => DEFAULT_MIN_DATE,
+                  :created_to => $now,
+                  :single_batch => single_batch,
+                  :fields => new_fields.map {|v| v.id},
+                  :timestamp => metadata_entity.custom["timestamp"]
+              })
+
+              metadata_entity.runtime["synchronization_source_filename"] = merge_files(metadata_entity.id,result[:filenames],"_synchronization")
+              backup_to_bds(metadata_entity.runtime["synchronization_source_filename"])
+            rescue => e
+              $log.warn "The download with Bulk API has failed, trying to download with normal API"
+              query = construct_query(metadata_entity,new_fields.map {|v| v.id},DEFAULT_MIN_DATE,$now,false)
+              $log.info "Executing query #{query}"
+              data = @client.query(query)
+              metadata_entity.runtime["synchronization_source_filename"] = create_file(data,metadata_entity,"_synchronization")
+              backup_to_bds(metadata_entity.runtime["synchronization_source_filename"])
             end
           end
         end
 
 
         def download_entity(metadata_entity)
+          clean(metadata_entity)
+          download_entity_data(metadata_entity)
+          download_entity_deleted_records(metadata_entity)
+          download_fields_for_additional_synchronization(metadata_entity)
+          # execute_validations(metadata_entity)
 
-          #metadata_entity = @metadata.get_entity(entity)
-          created_from = @metadata.get_configuration_by_type_and_key(@type,"created_from")
-          created_to = @metadata.get_configuration_by_type_and_key(@type,"created_to")
-          single_batch = @metadata.get_configuration_by_type_and_key(@type,"single_batch")
-
-          query = construct_query(metadata_entity)
-          $log.info "Executing query #{query}"
-          begin
-            result = @bulk_client.query(metadata_entity.id,query,
-                                            :directory_path => @data_directory,
-                                            :created_from => created_from,
-                                            :created_to => created_to,
-                                            :single_batch => single_batch
-            )
-            metadata_entity.runtime["source_filename"] = merge_files(metadata_entity.id,result[:filenames])
-            backup_to_bds(metadata_entity,metadata_entity.runtime["source_filename"])
-          rescue => e
-            $log.warn "The download with Bulk API has failed, trying to download with normal API"
-            query = construct_query(metadata_entity,created_from,created_to)
-            $log.info "Executing query #{query}"
-            data = @client.query(query)
-            metadata_entity.runtime["source_filename"] = create_file(data,metadata_entity)
-            backup_to_bds(metadata_entity,metadata_entity.runtime["source_filename"])
-          end
+          Metadata::Runtime.set_entity_last_load(metadata_entity.id,$now)
         end
 
 
         private
 
-        def construct_query(metadata_entity, created_from=nil, created_to=nil)
+
+        def clean(metadata_entity)
+          # Lets clean the runtime informations about the downloaded files
+          metadata_entity.runtime.delete("synchronization_source_filename")
+          metadata_entity.runtime.delete("source_deleted_filename")
+          metadata_entity.runtime.delete("source_filename")
+        end
+
+        def query_all(client,soql)
+          response = client.api_get 'queryAll', :q => soql
+          response.body
+        end
+
+        def construct_query(metadata_entity,fields,from,to,deleted = false, full = false)
           # TODO - FIX INTERVAL
           raise Base::DownloaderException,"There are no fields to download for entity: #{metadata_entity.name} (#{metadata_entity.id})" if metadata_entity.get_enabled_fields.empty?
-          base_query = "SELECT #{metadata_entity.get_enabled_fields.join(', ')} FROM #{metadata_entity.id}"
-          if created_from && created_to
-            return base_query + " WHERE CreatedDate >= #{created_from} AND CreatedDate < #{created_to}"
+          base_query = ""
+          base_query = "SELECT #{fields.join(', ')} FROM #{metadata_entity.id}"
+          # if (deleted)
+          #   base_query = "SELECT #{metadata_entity.custom["id"]},#{metadata_entity.custom["timestamp"]},IsDeleted FROM #{metadata_entity.id}"
+          # else
+          #   base_query = "SELECT #{metadata_entity.get_enabled_fields.join(', ')} FROM #{metadata_entity.id}"
+          # end
+
+          where = ""
+          if (!full and deleted)
+            where = " WHERE #{metadata_entity.custom["timestamp"]} >= #{from} AND #{metadata_entity.custom["timestamp"]} < #{to} and IsDeleted = true"
+          elsif (!full)
+            where = " WHERE #{metadata_entity.custom["timestamp"]} >= #{from} AND #{metadata_entity.custom["timestamp"]} < #{to}"
+          elsif (deleted )
+            where = " IsDeleted = true"
           end
-          if created_from
-            return base_query + " WHERE CreatedDate >= #{created_from}"
-          end
-          if created_to
-            return base_query + " WHERE CreatedDate < #{created_to}"
-          end
-          return base_query
+          return base_query + where
         end
 
 
-        def merge_files(entity,filenames)
+        def merge_files(entity,filenames,postfix = "")
           filenames.delete_if do |filename|
             delete = false
             File.open(filename) do |f|
@@ -217,7 +313,7 @@ module GoodData
             end
           end
           headers_written = false
-          output_filename = "#{@data_directory}#{entity}.csv"
+          output_filename = "#{@data_directory}#{entity}#{postfix}.csv"
           FasterCSV.open(output_filename, 'w',:quote_char => '"',:force_quotes => true) do |csv|
             filenames.each do |filename|
               FasterCSV.foreach(filename, :headers => true,:quote_char => '"') do |csv_inner|
@@ -234,8 +330,8 @@ module GoodData
         end
 
 
-        def create_file(data,metadata_entity)
-          output_filename = "#{@data_directory}#{metadata_entity.id}.csv"
+        def create_file(data,metadata_entity,postfix = "")
+          output_filename = "#{@data_directory}#{metadata_entity.id}#{postfix}.csv"
           CSV.open(output_filename , 'w', :force_quotes => true) do |csv|
             # get the list of fields and write them as a header
             csv << metadata_entity.fields.values.map {|f| f.id}
@@ -254,6 +350,37 @@ module GoodData
           end
           output_filename
         end
+
+        def create_deleted_file(data,metadata_entity)
+          output_filename = "#{@data_directory}#{metadata_entity.id}_deleted.csv"
+          CSV.open(output_filename , 'w', :force_quotes => true) do |csv|
+            # get the list of fields and write them as a header
+            fields = [metadata_entity.custom["id"],metadata_entity.custom["timestamp"],"IsDeleted"]
+            csv << fields
+            # write the stuff to the csv
+            data.map do |row_hash|
+              # get rid of the weird stuff coming from the api
+              csv_line = row_hash.values_at(*fields).map do |m|
+                if m.kind_of?(Array)
+                  m[0] == {"xsi:nil"=>"true"} ? nil : m[0]
+                else
+                  m
+                end
+              end
+              csv << csv_line
+            end
+          end
+          output_filename
+        end
+
+        #def download_deleted_record
+        #  #OBSOLETE
+        #  #request = "sobjects/Opportunity/deleted/?start=#{start_date}&end=#{end_date}"
+        #  #request.gsub!("+","%2B")
+        #  #pp @client.api_get(request).body
+        #end
+
+
 
       end
 
