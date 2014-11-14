@@ -1,3 +1,5 @@
+require 'gooddata_connectors_base/downloaders/base_downloader'
+
 module GoodDataConnectorsDownloaderSalesforce
 
 
