@@ -3,7 +3,7 @@ require 'gooddata_connectors_base/downloaders/base_downloader'
 module GoodDataConnectorsDownloaderSalesforce
 
 
-  class SalesForceDownloader < GoodDataConnectorsBase::BaseDownloader
+  class SalesForceDownloader < GoodData::Connectors::Base::BaseDownloader
     DEFAULT_VERSION = '29.0'
 
     attr_accessor :client,:bulk_client
