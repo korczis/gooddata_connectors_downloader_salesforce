@@ -6,7 +6,7 @@ require 'salesforce_bulk_query'
 require "gooddata_connectors_downloader_salesforce/version"
 require "gooddata_connectors_downloader_salesforce/salesforce_downloader"
 
-module GoodDataConnectorsDownloaderSalesforce
+module GoodData::Connectors::Downloader::Salesforce
 
 
   class SalesForceDownloaderMiddleWare < GoodData::Bricks::Middleware
