@@ -3,7 +3,7 @@ require 'salesforce_bulk_query'
 
 require 'gooddata_connectors_base/downloaders/base_downloader'
 
-module GoodData::Connectors::Downloader::Salesforce
+module GoodData::Connectors::DownloaderSalesforce
 
 
   class SalesForceDownloader < GoodData::Connectors::Base::BaseDownloader
