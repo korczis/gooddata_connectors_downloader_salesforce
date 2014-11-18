@@ -1,4 +1,5 @@
 require 'restforce'
+require 'salesforce_bulk_query'
 
 require 'gooddata_connectors_base/downloaders/base_downloader'
 
@@ -73,7 +74,7 @@ module GoodDataConnectorsDownloaderSalesforce
 
         Restforce.log = true if client_logger
 
-        @client = ::Restforce.new(credentials)
+        @client = Restforce.new(credentials)
         @client.authenticate!
 
         @bulk_client = SalesforceBulkQuery::Api.new(client, :logger => $log)
